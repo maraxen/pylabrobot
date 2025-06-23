@@ -8,6 +8,7 @@ import time
 from typing import List, Optional, Union
 
 from pylabrobot import utils
+from pylabrobot.resources import Plate
 
 from .backend import PlateReaderBackend
 
@@ -17,7 +18,7 @@ else:
   from typing_extensions import Literal
 
 try:
-  from pylibftdi import Device
+  from pylibftdi import Device, FtdiError
 
   USE_FTDI = True
 except ImportError:
@@ -26,19 +27,44 @@ except ImportError:
 
 logger = logging.getLogger("pylabrobot")
 
-
 class CLARIOStar(PlateReaderBackend):
-  """A plate reader backend for the Clario star. Note that this is not a complete implementation
-  and many commands and parameters are not implemented yet."""
+  """A plate reader backend for the CLARIOStar. Note that this is not a complete implementation
+  and many commands and parameters are not implemented yet.
 
-  def __init__(self):
+  The CLARIOStar is a plate reader from BMG Labtech. This backend uses the pylibftdi library to
+  communicate with the device. The CLARIOStar uses a proprietary protocol, so this backend is
+  limited to the commands that have been reverse engineered so far.
+
+  The CLARIOStar has a number of different modes, including luminescence, absorbance, and
+  fluorescence. This backend currently only supports luminescence and absorbance.
+
+  Args:
+    device_id (Optional[str]): The device ID of the ClarioStar. If not provided, the backend will
+    attempt to auto-detect the device ID. If you have multiple ClarioStars connected, you may need
+    to provide the device ID manually in order to select the correct device.
+  """
+
+  def __init__(self, device_id: Optional[str] = None):
     self.dev: Optional[Device] = None
+    self.device_id: Optional[str] = device_id
 
   async def setup(self):
     if not USE_FTDI:
       raise RuntimeError("pylibftdi is not installed. Run `pip install pylabrobot[plate_reading]`.")
 
-    self.dev = Device()
+    try:
+      self.dev = Device(device_id=self.device_id, pid=0xBB68)
+    except FtdiError:
+      try:
+        self.dev = Device(device_id=self.device_id)
+      except FtdiError:
+        raise RuntimeError("Could not find a ClarioStar device. Please check the device ID and \
+          make sure the device is connected.")
+      finally:
+        raise RuntimeError("ClarioStar firmware version is too old. Please update the firmware \
+          using the BMG Labtech Reader Control software.")
+
+    assert self.dev is not None, "device not initialized"
     self.dev.open()
     self.dev.baudrate = 125000
     self.dev.ftdi_fn.ftdi_set_line_property(8, 0, 0)  # 8N1
@@ -158,6 +184,21 @@ class CLARIOStar(PlateReaderBackend):
         logger.debug("status is ready")
         return ret
 
+  async def _wait_for_status(self, status : bytes):
+    last_status = None
+    while True:
+      await asyncio.sleep(0.1)
+
+      command_status = await self.read_command_status()
+
+      if command_status != last_status:
+        last_status = command_status
+        logger.info("status changed %s", command_status)
+        continue
+
+      if command_status == status:
+        return
+
   async def read_command_status(self):
     status = await self.send(b"\x02\x00\x09\x0c\x80\x00")
     return status
@@ -184,72 +225,130 @@ class CLARIOStar(PlateReaderBackend):
     )
     return await self._wait_for_ready_and_return(mp_and_focus_height_value_response)
 
-  async def _run_luminescence(self, focal_height: float):
+  async def _plate_bytes(plate: Plate):  #TODO: need to account for rotation
+    """
+    Returns a byte array representing the plate geometry. This is used to configure the plate
+    reader to read from the correct wells.
+    """
+    float_to_bytes = lambda f: round(f * 100).to_bytes(2, byteorder="big")
+
+    plate_length = plate.get_size_x()
+    plate_length_bytes = float_to_bytes(plate_length)
+    plate_width = plate.get_size_y()
+    plate_width_bytes = float_to_bytes(plate_width)
+    # distance from left edge to middle of first column of wells
+    # TODO: validate that this is the correct way to calculate this, seems correct from one test
+    plate_x1 = plate.get_well(0).location.x + plate.get_well(0).center().x
+    plate_x1_bytes = float_to_bytes(plate_x1)
+    # distance from top edge to middle of first row of wells
+    plate_y1 = plate.get_well(0).location.y + plate.get_well(0).center().y
+    plate_y1_bytes = float_to_bytes(plate_y1)
+    # distance from center of first column of wells to plate right edge
+    plate_xn = plate_length - plate_x1
+    plate_xn_bytes = float_to_bytes(plate_xn)
+    # distance from center of first row of wells to plate bottom edge
+    plate_yn = plate_width - plate_y1
+    plate_yn_bytes = float_to_bytes(plate_yn)
+    # number of columns
+    plate_cols = plate.num_items_x
+    plate_cols_byte = plate_cols.to_bytes(1, byteorder="big")
+    # number of rows
+    plate_rows = plate.num_items_y
+    plate_rows_byte = plate_rows.to_bytes(1, byteorder="big")
+    # wells to read, for now we assume all wells
+    wells = ([1] * plate.num_items) + ([0] * (384 - plate.num_items))
+    wells_bytes = sum(b << i for i, b in enumerate(wells[::-1])).to_bytes(48, 'big')
+
+    return plate_length_bytes + \
+      plate_width_bytes + \
+        plate_x1_bytes + \
+          plate_y1_bytes + \
+            plate_xn_bytes + \
+              plate_yn_bytes + \
+                plate_cols_byte + \
+                  plate_rows_byte + \
+                    wells_bytes
+
+  async def _assemble_command(self,
+                          plate: Plate,
+                          read_type: str,
+                          **kwargs) -> bytes:
+    """Send a command to the plate reader."""
+    read_type_bytes = {"luminescence": b"\x86",
+                        "absorbance": b"\x82",
+                        "fluorescence": b"\x86"}.get(read_type, None)
+    if read_type_bytes is None:
+      raise ValueError(f"unknown read type {read_type}")
+    base_command = bytes(b"\x02\x00\x86\x0c")
+    plate_bytes = await self._plate_bytes(plate)
+    shaker_mode = kwargs.get("shaker_mode", None)
+    path_length = kwargs.get("path_length", None)
+    gain = kwargs.get("gain", 4000)
+    wavelength = kwargs.get("wavelength", 600)
+    focal_height = kwargs.get("focal_height", 9.0)
+    number_flashes = kwargs.get("number_flashes", 22)
+    number_cycles = kwargs.get("number_cycles", 1)
+    shaking_time = kwargs.get("shaking_time", 30)
+    shaking_speed = kwargs.get("shaking_speed", 100)
+
+
+
+
+
+
+  # get pass in list of wells. get_child_identifier() to get the index of each well, then pass in the list of indices
+  # union of all the indices to get the list of wells to read
+
+  async def _run_luminescence(self, focal_height: float, plate: Plate, **kwargs): # TODO: list out all the kwargs
     """Run a plate reader luminescence run."""
 
     assert 0 <= focal_height <= 25, "focal height must be between 0 and 25 mm"
 
+
+
     focal_height_data = int(focal_height * 100).to_bytes(2, byteorder="big")
 
-    run_response = await self.send(
-      b"\x02\x00\x86\x0c\x04\x31\xec\x21\x66\x05\x96\x04\x60\x2c\x56"
-      b"\x1d\x06\x0c\x08\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00"
-      b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-      b"\x00\x00\x00\x00\x00\x00\x00\x00\x02\x01\x00\x00\x00\x00\x00\x00\x00\x20\x04\x00\x1e\x27"
+    base_command = bytes(b"\x02\x00\x86\x0c")
+
+    plate_bytes = await self._plate_bytes(plate)
+
+
+    run_response = await self.send(base_command + plate_bytes +
+                                   b"\x02\x01\x00\x00\x00\x00\x00\x00\x00\x20\x04\x00\x1e\x27"
       b"\x0f\x27\x0f\x01" + focal_height_data + b"\x00\x00\x01\x00\x00\x0e\x10\x00\x01\x00\x01\x00"
       b"\x01\x00\x01\x00\x01\x00\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x01"
       b"\x00\x00\x00\x01\x00\x64\x00\x20\x00\x00"
     )
 
-    # TODO: find a prettier way to do this. It's essentially copied from _wait_for_ready_and_return.
-    last_status = None
-    while True:
-      await asyncio.sleep(0.1)
+    completed_status = bytes(b"\x02\x00\x18\x0c\x01\x25\x04\x2e\x00\x00\x04\x01\x00\x00\x03\x00"
+      b"\x00\x00\x00\xc0\x00\x01\x46\x0d")
 
-      command_status = await self.read_command_status()
+    await self._wait_for_status(status=completed_status)
 
-      if command_status != last_status:
-        last_status = command_status
-        logger.info("status changed %s", command_status)
-        continue
+    return run_response
 
-      if command_status == bytes(
-        b"\x02\x00\x18\x0c\x01\x25\x04\x2e\x00\x00\x04\x01\x00\x00\x03\x00"
-        b"\x00\x00\x00\xc0\x00\x01\x46\x0d"
-      ):
-        return run_response
-
-  async def _run_absorbance(self, wavelength: float):
+  async def _run_absorbance(self, wavelength: float, plate: Plate):
     """Run a plate reader absorbance run."""
     wavelength_data = int(wavelength * 10).to_bytes(2, byteorder="big")
 
-    absorbance_command = (
-      b"\x02\x00\x7c\x0c\x04\x31\xec\x21\x66\x05\x96\x04\x60\x2c\x56\x1d\x06"
-      b"\x0c\x08\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00"
-      b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-      b"\x00\x00\x00\x00\x00\x00\x82\x02\x00\x00\x00\x00\x00\x00\x00\x20\x04\x00\x1e\x27\x0f\x27"
+    base_command = bytes(b"\x02\x00\x86\x0c")
+
+    plate_bytes = await self._plate_bytes(plate)
+
+
+    absorbance_command = (base_command + plate_bytes +
+      b"\x82\x02\x00\x00\x00\x00\x00\x00\x00\x20\x04\x00\x1e\x27\x0f\x27"
       b"\x0f\x19\x01" + wavelength_data + b"\x00\x00\x00\x64\x00\x00\x00\x00\x00\x00\x00\x64\x00"
       b"\x00\x00\x00\x00\x02\x00\x00\x00\x00\x01\x00\x00\x00\x01\x00\x16\x00\x01\x00\x00"
     )
     run_response = await self.send(absorbance_command)
 
-    # TODO: find a prettier way to do this. It's essentially copied from _wait_for_ready_and_return.
-    last_status = None
-    while True:
-      await asyncio.sleep(0.1)
+    completed_status = bytes(b"\x02\x00\x18\x0c\x01\x25\x04\x2e\x00\x00\x04\x01\x00\x00\x03\x00"
+      b"\x00\x00\x00\xc0\x00\x01\x46\x0d")
 
-      command_status = await self.read_command_status()
+    await self._wait_for_status(status=completed_status)
 
-      if command_status != last_status:
-        last_status = command_status
-        logger.info("status changed %s", command_status)
-        continue
-
-      if command_status == bytes(
-        b"\x02\x00\x18\x0c\x01\x25\x04\x2e\x00\x00\x04\x01\x00\x00\x03\x00"
-        b"\x00\x00\x00\xc0\x00\x01\x46\x0d"
-      ):
-        return run_response
+    return run_response
 
   async def _read_order_values(self):
     return await self.send(b"\x02\x00\x0f\x0c\x05\x1d\x00\x00\x00\x00\x00\x00")
@@ -261,11 +360,11 @@ class CLARIOStar(PlateReaderBackend):
   async def _get_measurement_values(self):
     return await self.send(b"\x02\x00\x0f\x0c\x05\x02\x00\x00\x00\x00\x00\x00")
 
-  async def read_luminescence(self, focal_height: float = 13) -> List[List[float]]:
+  async def read_luminescence(self, focal_height: float = 13, plate: Plate) -> List[List[float]]:
     """Read luminescence values from the plate reader."""
     await self._mp_and_focus_height_value()
 
-    await self._run_luminescence(focal_height=focal_height)
+    await self._run_luminescence(focal_height=focal_height, plate=plate)
 
     await self._read_order_values()
 
@@ -294,6 +393,7 @@ class CLARIOStar(PlateReaderBackend):
     self,
     wavelength: int,
     report: Literal["OD", "transmittance"] = "OD",
+    plate: Plate
   ) -> List[List[float]]:
     """Read absorbance values from the device.
 
@@ -308,7 +408,7 @@ class CLARIOStar(PlateReaderBackend):
 
     await self._mp_and_focus_height_value()
 
-    await self._run_absorbance(wavelength=wavelength)
+    await self._run_absorbance(wavelength=wavelength, plate=plate)
 
     await self._read_order_values()
 
@@ -357,5 +457,6 @@ class CLARIOStar(PlateReaderBackend):
     excitation_wavelength: int,
     emission_wavelength: int,
     focal_height: float,
+    plate: Plate
   ) -> List[List[float]]:
     raise NotImplementedError("Not implemented yet")

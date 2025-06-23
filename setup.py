@@ -11,7 +11,7 @@ extras_fw = ["pyserial", "pyusb", "libusb_package<=1.0.26.2"]
 extras_http = ["requests", "types-requests"]
 
 extras_plate_reading = [
-  "pylibftdi",
+  "pylibftdi<=0.23.0",
 ]
 
 extras_websockets = ["websockets==12.0"]
