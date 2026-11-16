@@ -812,6 +812,11 @@ class Fluorescence(Measurement):
         which the reader steps.
       count: the fluorescence channels of a discrete read, or a spectrum's wavelengths.
     """
+    if enhanced_dynamic_range and self._has_short_plate_block():
+      logger.warning(
+        "enhanced dynamic range is not sent on firmware %s: where it goes is not known",
+        self._driver.configuration.firmware_version,
+      )
     return (
       self._compute_run_start(
         plate,

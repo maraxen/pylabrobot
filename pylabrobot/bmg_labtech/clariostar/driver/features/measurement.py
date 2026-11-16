@@ -42,6 +42,11 @@ logger = logging.getLogger(__name__)
 # The well mask holds 384 bits; a 1536-well plate has no verified encoding.
 _WELL_MASK_SIZE = 48
 
+# Firmware whose RUN has the short plate block: no `00` between the plate geometry and the well
+# mask, and an 8-byte pre-separator in place of 31 bytes. Every RUN MARS sends an original
+# CLARIOstar on firmware 1.20 is laid out this way.
+SHORT_PLATE_BLOCK_FIRMWARE = frozenset({"1.20"})
+
 Corner = Literal["top_left", "top_right", "bottom_left", "bottom_right"]
 # Scan byte bits 6-5: the corner the scan starts at.
 _CORNERS: Dict[str, int] = {"top_left": 0, "top_right": 1, "bottom_left": 2, "bottom_right": 3}
@@ -586,6 +591,41 @@ class Measurement:
       block[20] = shake.duration
     return bytes(block)
 
+  # Short pre-separator bytes 4-7 without shaking, as MARS sends them.
+  _SHORT_NO_SHAKE = bytes.fromhex("2004001e")
+  # Short pre-separator byte 4 of a read with shaking, as MARS sends it.
+  _SHORT_SHAKE = 0x21
+
+  def _has_short_plate_block(self) -> bool:
+    """Whether the reader's RUN has the short plate block (`SHORT_PLATE_BLOCK_FIRMWARE`)."""
+    return self._driver.configuration.firmware_version in SHORT_PLATE_BLOCK_FIRMWARE
+
+  def _compute_short_pre_separator(
+    self, settings: MeasurementSettings, shake: Optional[ShakeSettings], *, optics: int = 0
+  ) -> bytes:
+    """The 8-byte pre-separator of `SHORT_PLATE_BLOCK_FIRMWARE`.
+
+    Byte 0 as in `_compute_pre_separator`, bytes 1-3 `00`, bytes 4-7 the shaking before the read:
+    `20 04 00 1e` without shaking; with an orbital shake `21`, the speed code (rpm / 100 - 1, as
+    on the Plus) and the seconds (u16 BE). Enhanced dynamic range is not sent: MARS's
+    luminescence frames on this firmware have `00` in bytes 1-3.
+
+    Raises:
+      ValueError: for a shake pattern other than orbital: the short pre-separator has no byte for
+        the pattern the Plus sends separately.
+    """
+    shaking = self._SHORT_NO_SHAKE
+    if shake is not None:
+      if shake.pattern != "orbital":
+        version = self._driver.configuration.firmware_version
+        raise ValueError(
+          f"a {shake.pattern} shake has no known encoding on firmware {version}; use orbital"
+        )
+      shaking = bytes([self._SHORT_SHAKE, shake.speed // 100 - 1]) + shake.duration.to_bytes(
+        2, "big"
+      )
+    return bytes([self._MODE | optics | _WELL_SCANS[settings.well_scan], 0, 0, 0]) + shaking
+
   def _compute_well_scan_field(self, plate: Plate, settings: MeasurementSettings) -> bytes:
     """The field after `27 0f 27 0f` of an orbital, spiral or matrix read; none for a point read.
 
@@ -625,15 +665,29 @@ class Measurement:
     The plate block, scan byte, pre-separator, `27 0f 27 0f`, the well-scan field and the settling
     byte. `optics` is ORed into the mode; `flying_mode` and `enhanced_dynamic_range` set their bits
     (`_compute_scan_byte`, `_compute_pre_separator`); `scan_byte` replaces the derived one.
+
+    On `SHORT_PLATE_BLOCK_FIRMWARE` the plate block has no `00` after the plate geometry and the
+    pre-separator is `_compute_short_pre_separator`; the scan byte is the same.
     """
     if scan_byte is None:
       scan_byte = self._compute_scan_byte(settings, flying_mode=flying_mode)
-    return (
-      self._encode_plate_block(plate, wells)
-      + bytes([scan_byte])
-      + self._compute_pre_separator(
-        settings, shake, optics=optics, enhanced_dynamic_range=enhanced_dynamic_range
+    if self._has_short_plate_block():
+      start = (
+        self._encode_plate_geometry(plate)
+        + self._encode_well_mask(plate, wells)
+        + bytes([scan_byte])
+        + self._compute_short_pre_separator(settings, shake, optics=optics)
       )
+    else:
+      start = (
+        self._encode_plate_block(plate, wells)
+        + bytes([scan_byte])
+        + self._compute_pre_separator(
+          settings, shake, optics=optics, enhanced_dynamic_range=enhanced_dynamic_range
+        )
+      )
+    return (
+      start
       + self._SEPARATOR
       + self._compute_well_scan_field(plate, settings)
       + bytes([self._compute_settling_byte(settings.settling_time)])
