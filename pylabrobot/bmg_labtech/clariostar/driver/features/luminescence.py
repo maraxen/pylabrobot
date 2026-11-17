@@ -23,6 +23,7 @@ from .measurement import (
   _get_measured_identifiers,
   _get_readings_by_well,
 )
+from .pumps import Injection
 
 if TYPE_CHECKING:
   from ..configuration import DeviceConfiguration
@@ -151,6 +152,8 @@ class Luminescence(Measurement):
     measurement: MeasurementSettings,
     *,
     timeout: Optional[float] = None,
+    injections: Sequence[Injection] = (),
+    cycle_time: Optional[int] = None,
   ) -> None:
     """Raise if the emission band, gain, focal height, times or read settings are out of range.
 
@@ -162,7 +165,8 @@ class Luminescence(Measurement):
         `wavelength_range`, `_check_bandwidth`'s, `_check_gain`'s, `_check_focal_height`'s (None
         is the default's, checked with the plate), a normalization time or measurement interval
         not in 0.01 s steps within `time_range`, a well scan other than a point, a pause before
-        reading, a timeout not positive.
+        reading, a timeout not positive, injections on a reader without pumps, a cycle time not
+        whole seconds from 1 to 65535.
     """
     errors = self._check_monochromator("luminescence")
     lowest, highest = self.configuration.wavelength_range
@@ -193,6 +197,12 @@ class Luminescence(Measurement):
       errors.append("a pause before reading is not supported for luminescence")
     if timeout is not None and not timeout > 0:
       errors.append(f"timeout must be positive, got {timeout}")
+    if injections and self._driver.pumps is None:
+      errors.append("this reader reports no injector pump: a read cannot inject")
+    if cycle_time is not None and (
+      not isinstance(cycle_time, int) or not 1 <= cycle_time <= 0xFFFF
+    ):
+      errors.append(f"cycle_time must be whole seconds from 1 to 65535, got {cycle_time!r}")
     if errors:
       raise ValueError("; ".join(errors))
 
@@ -220,13 +230,16 @@ class Luminescence(Measurement):
     focal_height: float,
     normalization_time: float,
     measurement_interval: float,
+    cycle_time: int = 1,
+    injections: bytes = b"\x00",
   ) -> bytes:
     """The RUN parameters of a luminescence read.
 
     The run start (`_compute_run_start`, with enhanced dynamic range), the focal height in
     0.01 mm, the gain u16 BE, the emission band's nominal edges in 0.1 nm (`_compute_band_edges`),
     the normalization time in 0.01 s, then the run end with the measurement interval in 0.01 s
-    where an absorbance or fluorescence read has its flashes.
+    where an absorbance or fluorescence read has its flashes, the cycle time and the injection
+    field (`Pumps.encode_injections`).
     """
     upper, lower = _compute_band_edges(emission_wavelength, emission_bandwidth)
     return (
@@ -240,7 +253,9 @@ class Luminescence(Measurement):
       + self._AFTER_EMISSION
       + round(normalization_time * 100).to_bytes(2, "big")
       + self._BEFORE_RUN_END
-      + self._compute_run_end(round(measurement_interval * 100))
+      + self._compute_run_end(
+        round(measurement_interval * 100), cycle_time=cycle_time, injections=injections
+      )
     )
 
   # -- decoding ------------------------------------------------------------------------------------
@@ -288,6 +303,8 @@ class Luminescence(Measurement):
     wells: Optional[List[Well]],
     *,
     timeout: Optional[float],
+    injections: Sequence[Injection] = (),
+    cycle_time: Optional[int] = None,
   ) -> Tuple[Plate, List[Well], bytes]:
     """The plate, the wells and the RUN parameters of a read, every argument checked.
 
@@ -305,7 +322,13 @@ class Luminescence(Measurement):
       measurement_interval,
       measurement,
       timeout=timeout,
+      injections=injections,
+      cycle_time=cycle_time,
     )
+    injection_field = b"\x00"
+    if injections:
+      assert self._driver.pumps is not None  # checked above
+      injection_field = self._driver.pumps.encode_injections(injections)
     plate, measured = self._get_plate_and_wells(measurement, shake, wells)
     if focal_height is None:
       focal_height = self._get_default_focal_height(measured)
@@ -320,6 +343,8 @@ class Luminescence(Measurement):
       focal_height=focal_height,
       normalization_time=normalization_time,
       measurement_interval=measurement_interval,
+      cycle_time=1 if cycle_time is None else cycle_time,
+      injections=injection_field,
     )
     return plate, measured, parameters
 
@@ -338,6 +363,8 @@ class Luminescence(Measurement):
     simulated_data: Optional[LuminescenceResult] = None,
     timeout: Optional[float] = None,
     results_directory: Optional[str] = None,
+    injections: Sequence[Injection] = (),
+    cycle_time: Optional[int] = None,
   ) -> CLARIOstarLuminescenceResult:
     """Measure the plate's luminescence through the emission monochromator.
 
@@ -367,14 +394,23 @@ class Luminescence(Measurement):
         96-well plate in about 105 s.
       results_directory: the directory the read's rows are appended to once it is complete
         (`pylabrobot.lib.results.directory`); None writes none.
+      injections: at most two `Injection`s into each measured well, from the injector pumps,
+        before the wells are read (encoding from MARS's RUNs on firmware 1.20; not yet sent from
+        this driver to a reader). On firmware in `Pumps.DOOR_CHECKED_FIRMWARE` the reagent door
+        must read open.
+      cycle_time: the RUN's cycle time in whole seconds; None sends 1, as for every read without
+        injection. MARS sends its own estimate of the run instead (337-345 s for its injection
+        reads with a 300 s shake); whether the reader needs more than 1 s when it injects is not
+        known.
 
     Returns:
       the counts of the measured wells, with the emission band, the gain and the focal height they
       were read with.
 
     Raises:
-      RuntimeError: if no plate is in the plate holder, the drawer is open, the run ends without its
-        data, or the last write to the results directory failed.
+      RuntimeError: if no plate is in the plate holder, the drawer is open, the reagent door is shut
+        for a read that injects, the run ends without its data, or the last write to the results
+        directory failed.
       ValueError: if an argument is out of range (`_check_arguments`), the settings cannot read
         the wells of the plate, the reply is not this read's (`_decode_data_reply`), or the results
         directory cannot be created or written.
@@ -396,7 +432,18 @@ class Luminescence(Measurement):
       shake_settings,
       wells,
       timeout=timeout,
+      injections=injections,
+      cycle_time=cycle_time,
     )
+    if injections:
+      assert self._driver.pumps is not None
+      self._warn_untested("a luminescence read with injection")
+      if cycle_time is None:
+        logger.warning(
+          "injecting with a 1 s cycle time; MARS sends its estimate of the run, and whether the"
+          " reader needs it is not known"
+        )
+      await self._driver.pumps.check_door_open_for_injection()
     timeout = self.default_read_timeout if timeout is None else timeout
     if focal_height is None:
       focal_height = self._get_default_focal_height(wells)

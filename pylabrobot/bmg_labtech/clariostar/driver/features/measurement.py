@@ -693,18 +693,21 @@ class Measurement:
       + bytes([self._compute_settling_byte(settings.settling_time)])
     )
 
-  def _compute_run_end(self, flashes: int) -> bytes:
+  def _compute_run_end(
+    self, flashes: int, *, cycle_time: int = 1, injections: bytes = b"\x00"
+  ) -> bytes:
     """The RUN parameters of an endpoint read after the mode's own fields.
 
-    `_TRAILER_START`, the trailer, 1 cycle, the flashes (u16 BE), a 1 s cycle time, `00`.
+    `_TRAILER_START`, the trailer, 1 cycle, the flashes (u16 BE), the cycle time in s (u16 BE; 1
+    unless given), then the injection field (`Pumps.encode_injections`): `00` without injection.
     """
     return (
       bytes([self._TRAILER_START])
       + self._TRAILER_REST
       + b"\x01"
       + flashes.to_bytes(2, "big")
-      + (1).to_bytes(2, "big")
-      + b"\x00"
+      + cycle_time.to_bytes(2, "big")
+      + injections
     )
 
   # ----------------------------------------

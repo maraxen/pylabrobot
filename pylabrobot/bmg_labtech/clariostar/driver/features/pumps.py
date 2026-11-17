@@ -8,7 +8,8 @@ pump 1 at 500 uL and 100 uL/s, and the reagent door bit while idle.
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, Dict, FrozenSet, Optional, Tuple
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, FrozenSet, Optional, Sequence, Tuple
 
 from pylabrobot.bmg_labtech.protocol.errors import FrameError
 
@@ -18,6 +19,26 @@ if TYPE_CHECKING:
   from ..master import CLARIOstarDriver
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Injection:
+  """One injection into each read well, by an injector pump, as part of a read.
+
+  Attributes:
+    pump: 1 or 2.
+    volume: uL per well, in steps of 1/6 uL (the RUN carries 6 x uL).
+    flow_rate: uL/s, one of `Pumps.INJECTION_FLOW_RATE_CODES`.
+    smart_dispensing: MARS's smart dispensing.
+    shake_duration: the seconds of shaking MARS's per-injection "shake time" sets; 0 for none.
+      When the reader shakes relative to the injection is not verified.
+  """
+
+  pump: int
+  volume: float
+  flow_rate: int = 300
+  smart_dispensing: bool = True
+  shake_duration: int = 0
 
 
 class Pumps:
@@ -50,6 +71,23 @@ class Pumps:
   )
   # Firmware on which STATUS byte 3 bit 6 is checked to be the reagent door.
   DOOR_CHECKED_FIRMWARE: FrozenSet[str] = frozenset({"1.20"})
+
+  # Injections in a read: the RUN's last byte (`00` without injection) is their count, then one
+  # 10-byte block each: `[pump | 0x10 with smart dispensing] [flow rate code] [6 x uL, u16 BE]
+  # 00 00 00 01 [shake s, u16 BE]`. From MARS's luminescence RUNs to an original CLARIOstar on
+  # firmware 1.20; 50 uL/s's code comes from those RUNs only, the others are prime's.
+  INJECTION_FLOW_RATE_CODES: Dict[int, int] = {50: 0x0F, 100: 0x0C, 300: 0x04, 430: 0x01}
+  INJECTION_VOLUME_FACTOR = 6
+  INJECTION_SMART_DISPENSING = 0x10
+  INJECTION_CONSTANT = bytes([0x00, 0x00, 0x00, 0x01])
+  # MARS's reads that completed had one or two injections.
+  MAX_INJECTIONS = 2
+  # Settings of the injections in reads MARS completed on firmware 1.20: (flow rates, volumes);
+  # all with smart dispensing and no per-injection shaking. Others are sent with a warning.
+  SEEN_INJECTION: Tuple[FrozenSet[int], FrozenSet[float]] = (
+    frozenset({300}),
+    frozenset({1.0, 3.0, 5.0}),
+  )
 
   # Seconds a pump command may run: 2000 uL at 100 uL/s takes about 1 min, 4500 uL about 2 min.
   default_timeout: float = 300.0
@@ -109,6 +147,95 @@ class Pumps:
     return bytes(
       [pump_byte, self.FLOW_RATE_CODES[int(flow_rate)], int(volume) // self.VOLUME_UNIT_UL]
     )
+
+  def encode_injections(self, injections: Sequence[Injection]) -> bytes:
+    """The RUN's injection field: the count, then one block per injection; `00` for none.
+
+    Logs a warning for a setting whose encoding is inferred rather than seen in a completed read.
+
+    Raises:
+      ValueError: listing every injection setting that is out of range, unencoded or not fitted.
+    """
+    errors = []
+    if len(injections) > self.MAX_INJECTIONS:
+      errors.append(f"at most {self.MAX_INJECTIONS} injections per read, got {len(injections)}")
+    blocks = b""
+    for index, injection in enumerate(injections, 1):
+      where = f"injection {index}"
+      pump = injection.pump
+      if not isinstance(pump, int) or pump not in self.ENCODED_PUMPS:
+        errors.append(f"{where}: pump must be one of {self.ENCODED_PUMPS}, got {pump!r}")
+      elif pump not in self._fitted():
+        errors.append(f"{where}: pump {pump} is not fitted (fitted: {self._fitted() or 'none'})")
+      if injection.flow_rate not in self.INJECTION_FLOW_RATE_CODES:
+        errors.append(
+          f"{where}: flow_rate must be one of {sorted(self.INJECTION_FLOW_RATE_CODES)} uL/s, got"
+          f" {injection.flow_rate!r}"
+        )
+      raw_volume = injection.volume * self.INJECTION_VOLUME_FACTOR
+      if (
+        not injection.volume > 0
+        or abs(raw_volume - round(raw_volume)) > 1e-9
+        or round(raw_volume) > 0xFFFF
+      ):
+        errors.append(
+          f"{where}: volume must be a positive multiple of 1/{self.INJECTION_VOLUME_FACTOR} uL,"
+          f" got {injection.volume!r}"
+        )
+      shake = injection.shake_duration
+      if not isinstance(shake, int) or not 0 <= shake <= 0xFFFF:
+        errors.append(f"{where}: shake_duration must be whole seconds from 0, got {shake!r}")
+      if errors:
+        continue
+      seen_flow_rates, seen_volumes = self.SEEN_INJECTION
+      if (
+        injection.flow_rate not in seen_flow_rates
+        or injection.volume not in seen_volumes
+        or not injection.smart_dispensing
+        or shake
+      ):
+        logger.warning(
+          "%s (pump %d, %g uL at %d uL/s, smart dispensing %s, shake %d s): this setting's"
+          " encoding is inferred, not seen in a completed read",
+          where,
+          pump,
+          injection.volume,
+          injection.flow_rate,
+          "on" if injection.smart_dispensing else "off",
+          shake,
+        )
+      blocks += (
+        bytes(
+          [
+            pump | (self.INJECTION_SMART_DISPENSING if injection.smart_dispensing else 0),
+            self.INJECTION_FLOW_RATE_CODES[injection.flow_rate],
+          ]
+        )
+        + round(raw_volume).to_bytes(2, "big")
+        + self.INJECTION_CONSTANT
+        + shake.to_bytes(2, "big")
+      )
+    if errors:
+      raise ValueError("; ".join(errors))
+    return bytes([len(injections)]) + blocks
+
+  async def check_door_open_for_injection(self) -> None:
+    """Raise unless the reagent door reads open, on firmware in `DOOR_CHECKED_FIRMWARE`.
+
+    The reader answers a prime with the door shut with quit codes 243/12; a read that injects is
+    assumed to need the door open too [not verified]. On other firmware the door is not checked.
+
+    Raises:
+      RuntimeError: if the door bit reads the door shut.
+    """
+    if not self._door_checked():
+      logger.warning(
+        "the reagent door bit is not checked on firmware %s; injecting without checking the door",
+        self._driver.configuration.firmware_version,
+      )
+      return
+    if not (await self._driver.request_status()).reagent_door_open:
+      raise RuntimeError("open the reagent door: the reader injects only with it open")
 
   async def _run(
     self,

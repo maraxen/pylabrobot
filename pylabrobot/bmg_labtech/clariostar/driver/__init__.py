@@ -18,6 +18,7 @@ from .features import (
   Luminescence,
   LuminescenceConfiguration,
   MeasurementSettings,
+  Injection,
   Pumps,
   ShakeSettings,
   TemperatureController,
