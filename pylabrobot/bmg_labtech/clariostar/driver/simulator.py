@@ -54,7 +54,7 @@ from .features.measurement import (
   _get_measured_identifiers,
   _get_readings_by_well,
 )
-from .features.pumps import Pumps
+from .features.pumps import Injection, Pumps
 from .features.temperature_controller import TemperatureController
 from .master import CLARIOstarDriver, CLARIOstarStatus
 
@@ -635,13 +635,16 @@ class CLARIOstarSimulationLuminescence(Luminescence):
     simulated_data: Optional[LuminescenceResult] = None,
     timeout: Optional[float] = None,
     results_directory: Optional[str] = None,
+    injections: Sequence[Injection] = (),
+    cycle_time: Optional[int] = None,
   ) -> CLARIOstarLuminescenceResult:
     """Check and encode the read; every measured well reads random counts.
 
     Args:
       wells, emission_wavelength, emission_bandwidth, gain, focal_height, normalization_time,
         measurement_interval, measurement_settings, shake_settings, timeout,
-        results_directory: as `Luminescence.measure`.
+        results_directory, injections, cycle_time: as `Luminescence.measure`; injections are
+        checked and encoded, and inject nothing.
       simulated_data: a result an earlier `measure` returned with the same emission band, on a
         reader or in simulation; each measured well reads its counts there instead.
 
@@ -666,6 +669,8 @@ class CLARIOstarSimulationLuminescence(Luminescence):
       shake_settings,
       wells,
       timeout=timeout,
+      injections=injections,
+      cycle_time=cycle_time,
     )
     identifiers = _get_measured_identifiers(plate, wells)
     logger.info(

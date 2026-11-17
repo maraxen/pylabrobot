@@ -17,6 +17,7 @@ from pylabrobot.bmg_labtech.clariostar.driver.configuration import (
   read_configuration,
 )
 from pylabrobot.bmg_labtech.clariostar.driver.configuration_tests import decoded
+from pylabrobot.bmg_labtech.clariostar.driver.features.pumps import Injection
 from pylabrobot.bmg_labtech.clariostar.driver.simulator import (
   CLARIOstarSimulationDriver,
   CLARIOstarSimulationPumps,
@@ -33,7 +34,7 @@ from pylabrobot.lib.results.reading import load_rows
 from pylabrobot.lib.results.table import get_table
 from pylabrobot.resources import Coordinate, Plate
 from pylabrobot.resources.biorad.plates import biorad_96_wellplate_200uL_Vb
-from pylabrobot.resources.corning.plates import cor_96_wellplate_2mL_Vb
+from pylabrobot.resources.corning.plates import cor_96_wellplate_2mL_Vb, cor_96_wellplate_360uL_Fb
 from pylabrobot.utils.timing import run_cycles
 
 LOCATION_IN = Coordinate(10, 20, 30)  # made up: the real ones are not measured yet
@@ -266,6 +267,27 @@ class SimulatorPumpsTests(unittest.IsolatedAsyncioTestCase):
     await driver.pumps.backflush(2, volume=1000, flow_rate=430)
     with self.assertRaises(ValueError):
       await driver.pumps.prime(1, volume=500, flow_rate=50)
+
+  async def test_a_simulated_read_checks_its_injections(self):
+    recording = os.path.join(
+      os.path.dirname(__file__), "recordings", "clariostar_1_20_temperature_controller_pumps_2.json"
+    )
+    reader = CLARIOstar(simulation=True, declared_configuration_json=recording)
+    await reader.setup()
+    await reader.driver.drawer.open()
+    plate = cor_96_wellplate_360uL_Fb("plate")
+    reader.plate_holder.assign_child_resource(plate)
+    await reader.driver.drawer.close()
+    luminescence = reader.luminescence
+    assert luminescence is not None
+    result = await luminescence.measure(
+      wells=plate.get_items("A1:H1"),
+      injections=[Injection(pump=1, volume=10)],
+      cycle_time=120,
+    )
+    self.assertEqual(len(result.data), 8)
+    with self.assertRaisesRegex(ValueError, "at most 2 injections"):
+      await luminescence.measure(injections=[Injection(pump=1, volume=5)] * 3)
 
   async def test_the_device_exposes_the_pumps(self):
     recording = os.path.join(
