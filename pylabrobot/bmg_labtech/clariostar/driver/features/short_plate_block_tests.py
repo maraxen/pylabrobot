@@ -17,6 +17,7 @@ from pylabrobot.bmg_labtech.clariostar.driver.configuration_tests import (
   CLARIOSTAR_1_20_PARAMETERS_PAYLOAD,
   decoded,
 )
+from pylabrobot.bmg_labtech.clariostar.driver.features import measurement as measurement_module
 from pylabrobot.bmg_labtech.clariostar.driver.features.absorbance import Absorbance
 from pylabrobot.bmg_labtech.clariostar.driver.features.absorbance_tests import (
   RUN_REPLY,
@@ -30,7 +31,6 @@ from pylabrobot.bmg_labtech.clariostar.driver.features.luminescence_tests import
   LUMINESCENCE_DATA_REPLY,
   plate,
 )
-from pylabrobot.bmg_labtech.clariostar.driver.features import measurement as measurement_module
 from pylabrobot.bmg_labtech.clariostar.driver.features.measurement import (
   Measurement,
   MeasurementSettings,
